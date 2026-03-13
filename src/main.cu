@@ -95,28 +95,66 @@ std::vector<uint8_t> GenerateSyntheticImages(int num_images, int width, int heig
     std::vector<uint8_t> images(static_cast<size_t>(num_images) * pixels_per_image);
 
     std::mt19937 rng(12345);
-    std::uniform_int_distribution<int> noise_dist(0, 30);
+    std::uniform_int_distribution<int> noise_dist(-12, 12);
 
     for (int n = 0; n < num_images; ++n) {
         uint8_t* image = images.data() + static_cast<size_t>(n) * pixels_per_image;
-        const int cx = width / 2 + (n % 13) * 7 - 40;
-        const int cy = height / 2 + (n % 17) * 5 - 40;
-        const int radius = 120 + (n % 5) * 20;
+
+        const int circle_cx = width / 4 + (n * 37) % (width / 2);
+        const int circle_cy = height / 4 + (n * 29) % (height / 2);
+        const int circle_radius = 80 + (n % 7) * 22;
+
+        const int rect_x0 = width / 8 + (n * 23) % (width / 2);
+        const int rect_y0 = height / 3 + (n * 19) % (height / 3);
+        const int rect_w = width / 7 + (n % 5) * (width / 28);
+        const int rect_h = height / 9 + (n % 4) * (height / 30);
+
+        const int ring_cx = 3 * width / 4 - (n * 17) % (width / 3);
+        const int ring_cy = 2 * height / 3 - (n * 11) % (height / 4);
+        const int ring_radius = 90 + (n % 6) * 18;
+        const int ring_thickness = 8 + (n % 4) * 3;
+
+        const float stripe_freq_x = 0.010f + 0.0015f * static_cast<float>(n % 5);
+        const float stripe_freq_y = 0.014f + 0.0010f * static_cast<float>(n % 7);
+        const int diag_period = 90 + (n % 6) * 15;
 
         for (int y = 0; y < height; ++y) {
             for (int x = 0; x < width; ++x) {
-                const int dx = x - cx;
-                const int dy = y - cy;
-                const float dist = std::sqrt(static_cast<float>(dx * dx + dy * dy));
-                int value = (x * 255) / width;
+                int value = 25 + (180 * x) / std::max(1, width - 1);
+                value += static_cast<int>(22.0f * std::sin(stripe_freq_x * static_cast<float>(x) + 0.3f * n));
+                value += static_cast<int>(18.0f * std::cos(stripe_freq_y * static_cast<float>(y) + 0.2f * n));
 
-                if (dist < radius) {
-                    value = 220;
+                if (((x / 48) + (y / 48) + n) % 2 == 0) {
+                    value += 10;
                 }
-                if (((x / 64) + (y / 64) + n) % 2 == 0) {
-                    value = std::min(255, value + 20);
+
+                const int dx_circle = x - circle_cx;
+                const int dy_circle = y - circle_cy;
+                const float circle_dist = std::sqrt(static_cast<float>(dx_circle * dx_circle + dy_circle * dy_circle));
+                if (circle_dist <= static_cast<float>(circle_radius)) {
+                    value = 225;
                 }
-                value = std::min(255, std::max(0, value + noise_dist(rng)));
+
+                if (x >= rect_x0 && x < rect_x0 + rect_w && y >= rect_y0 && y < rect_y0 + rect_h) {
+                    value = 70;
+                }
+
+                const int dx_ring = x - ring_cx;
+                const int dy_ring = y - ring_cy;
+                const float ring_dist = std::sqrt(static_cast<float>(dx_ring * dx_ring + dy_ring * dy_ring));
+                if (std::abs(ring_dist - static_cast<float>(ring_radius)) <= static_cast<float>(ring_thickness)) {
+                    value = 250;
+                }
+
+                if (((x + y + 7 * n) % diag_period) < 3) {
+                    value = 240;
+                }
+                if (((x - 2 * y + 11 * n) % (diag_period + 35) + (diag_period + 35)) % (diag_period + 35) < 3) {
+                    value = 35;
+                }
+
+                value += noise_dist(rng);
+                value = std::min(255, std::max(0, value));
                 image[static_cast<size_t>(y) * width + x] = static_cast<uint8_t>(value);
             }
         }
