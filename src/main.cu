@@ -1,213 +1,160 @@
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <random>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
-
-#define CHECK_CUDA(call)                                                     \
-    do {                                                                     \
-        cudaError_t err__ = (call);                                          \
-        if (err__ != cudaSuccess) {                                          \
-            std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__   \
-                      << " -> " << cudaGetErrorString(err__) << std::endl;  \
-            std::exit(EXIT_FAILURE);                                         \
-        }                                                                    \
-    } while (0)
 
 namespace {
 
 constexpr int kTileDim = 16;
 constexpr int kBlurRadius = 1;
 constexpr int kSobelRadius = 1;
+constexpr int kDefaultNumImages = 256;
+constexpr int kDefaultWidth = 2048;
+constexpr int kDefaultHeight = 2048;
+constexpr float kDefaultThreshold = 120.0f;
 
-struct Config {
-    int num_images = 256;
-    int width = 2048;
-    int height = 2048;
-    int threshold = 100;
-    bool save_cpu_outputs = false;
-    std::string output_dir = "output";
+struct Options {
+    int num_images = kDefaultNumImages;
+    int width = kDefaultWidth;
+    int height = kDefaultHeight;
+    float threshold = kDefaultThreshold;
 };
 
-struct Timings {
-    double cpu_blur_ms = 0.0;
-    double cpu_sobel_ms = 0.0;
-    double cpu_threshold_ms = 0.0;
+struct TimingResults {
     double cpu_total_ms = 0.0;
+    double gpu_total_ms = 0.0;
+    double gpu_h2d_ms = 0.0;
     double gpu_blur_ms = 0.0;
     double gpu_sobel_ms = 0.0;
     double gpu_threshold_ms = 0.0;
-    double gpu_total_ms = 0.0;
+    double gpu_d2h_ms = 0.0;
 };
 
-__host__ __device__ int ClampInt(int value, int low, int high) {
-    return value < low ? low : (value > high ? high : value);
+inline int ClampInt(int value, int low, int high) {
+    return (value < low) ? low : ((value > high) ? high : value);
 }
+
+#define CUDA_CHECK(call)                                                         \
+    do {                                                                         \
+        cudaError_t err__ = (call);                                              \
+        if (err__ != cudaSuccess) {                                              \
+            std::cerr << "CUDA error: " << cudaGetErrorString(err__)             \
+                      << " at " << __FILE__ << ":" << __LINE__ << std::endl;     \
+            std::exit(EXIT_FAILURE);                                             \
+        }                                                                        \
+    } while (0)
 
 void PrintUsage(const char* program_name) {
-    std::cout << "Usage: " << program_name << " [options]\n"
-              << "Options:\n"
-              << "  --num-images N      Number of synthetic images (default: 256)\n"
-              << "  --width W           Image width (default: 2048)\n"
-              << "  --height H          Image height (default: 2048)\n"
-              << "  --threshold T       Edge threshold 0-255 (default: 100)\n"
-              << "  --output-dir PATH   Output directory (default: output)\n"
-              << "  --save-cpu          Save CPU sample outputs too\n"
-              << "  --help              Show this message\n";
+    std::cout << "Usage: " << program_name
+              << " [--num_images N] [--width W] [--height H] [--threshold T]\n";
 }
 
-Config ParseArgs(int argc, char** argv) {
-    Config cfg;
+Options ParseArguments(int argc, char** argv) {
+    Options options;
     for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        auto require_value = [&](const std::string& name) -> std::string {
-            if (i + 1 >= argc) {
-                throw std::runtime_error("Missing value for " + name);
-            }
-            return argv[++i];
-        };
-
-        if (arg == "--num-images") {
-            cfg.num_images = std::stoi(require_value(arg));
-        } else if (arg == "--width") {
-            cfg.width = std::stoi(require_value(arg));
-        } else if (arg == "--height") {
-            cfg.height = std::stoi(require_value(arg));
-        } else if (arg == "--threshold") {
-            cfg.threshold = std::stoi(require_value(arg));
-        } else if (arg == "--output-dir") {
-            cfg.output_dir = require_value(arg);
-        } else if (arg == "--save-cpu") {
-            cfg.save_cpu_outputs = true;
-        } else if (arg == "--help") {
+        const std::string arg = argv[i];
+        if (arg == "--num_images" && i + 1 < argc) {
+            options.num_images = std::stoi(argv[++i]);
+        } else if (arg == "--width" && i + 1 < argc) {
+            options.width = std::stoi(argv[++i]);
+        } else if (arg == "--height" && i + 1 < argc) {
+            options.height = std::stoi(argv[++i]);
+        } else if (arg == "--threshold" && i + 1 < argc) {
+            options.threshold = std::stof(argv[++i]);
+        } else if (arg == "--help" || arg == "-h") {
             PrintUsage(argv[0]);
             std::exit(EXIT_SUCCESS);
         } else {
-            throw std::runtime_error("Unknown argument: " + arg);
+            std::cerr << "Unknown argument: " << arg << std::endl;
+            PrintUsage(argv[0]);
+            std::exit(EXIT_FAILURE);
         }
     }
 
-    if (cfg.num_images <= 0 || cfg.width <= 0 || cfg.height <= 0) {
-        throw std::runtime_error("Image counts and dimensions must be positive.");
+    if (options.num_images <= 0 || options.width <= 0 || options.height <= 0) {
+        std::cerr << "All dimensions and image count must be positive." << std::endl;
+        std::exit(EXIT_FAILURE);
     }
-    cfg.threshold = ClampInt(cfg.threshold, 0, 255);
-    return cfg;
+    return options;
 }
 
-std::vector<uint8_t> GenerateSyntheticBatch(const Config& cfg) {
-    const size_t pixels_per_image = static_cast<size_t>(cfg.width) * cfg.height;
-    std::vector<uint8_t> batch(static_cast<size_t>(cfg.num_images) * pixels_per_image);
+std::vector<uint8_t> GenerateSyntheticImages(int num_images, int width, int height) {
+    const size_t pixels_per_image = static_cast<size_t>(width) * static_cast<size_t>(height);
+    std::vector<uint8_t> images(static_cast<size_t>(num_images) * pixels_per_image);
 
     std::mt19937 rng(12345);
-    std::uniform_int_distribution<int> noise_dist(0, 24);
+    std::uniform_int_distribution<int> noise_dist(0, 30);
 
-    for (int img = 0; img < cfg.num_images; ++img) {
-        uint8_t* image = batch.data() + static_cast<size_t>(img) * pixels_per_image;
-        const int center_x = cfg.width / 2 + (img % 11 - 5) * (cfg.width / 20);
-        const int center_y = cfg.height / 2 + (img % 13 - 6) * (cfg.height / 24);
-        const int radius = std::max(24, std::min(cfg.width, cfg.height) / 6 + (img % 5) * 10);
+    for (int n = 0; n < num_images; ++n) {
+        uint8_t* image = images.data() + static_cast<size_t>(n) * pixels_per_image;
+        const int cx = width / 2 + (n % 13) * 7 - 40;
+        const int cy = height / 2 + (n % 17) * 5 - 40;
+        const int radius = 120 + (n % 5) * 20;
 
-        for (int y = 0; y < cfg.height; ++y) {
-            for (int x = 0; x < cfg.width; ++x) {
-                const int idx = y * cfg.width + x;
-                const float gradient = 255.0f * static_cast<float>(x) / std::max(1, cfg.width - 1);
-                const int dx = x - center_x;
-                const int dy = y - center_y;
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const int dx = x - cx;
+                const int dy = y - cy;
                 const float dist = std::sqrt(static_cast<float>(dx * dx + dy * dy));
-                const float circle = dist < radius ? 120.0f : 0.0f;
-                const float stripe = ((x / 32 + y / 32 + img) % 2 == 0) ? 35.0f : 0.0f;
-                const int noise = noise_dist(rng);
-                const int value = static_cast<int>(gradient * 0.45f + circle + stripe + noise);
-                image[idx] = static_cast<uint8_t>(ClampInt(value, 0, 255));
+                int value = (x * 255) / width;
+
+                if (dist < radius) {
+                    value = 220;
+                }
+                if (((x / 64) + (y / 64) + n) % 2 == 0) {
+                    value = std::min(255, value + 20);
+                }
+                value = std::min(255, std::max(0, value + noise_dist(rng)));
+                image[static_cast<size_t>(y) * width + x] = static_cast<uint8_t>(value);
             }
         }
     }
-    return batch;
+    return images;
 }
 
-void SavePgm(const std::string& path, const uint8_t* data, int width, int height) {
-    std::ofstream out(path, std::ios::binary);
+void SavePGM(const std::string& filename, const std::vector<uint8_t>& image,
+             int width, int height) {
+    std::ofstream out(filename, std::ios::binary);
     if (!out) {
-        throw std::runtime_error("Failed to open output file: " + path);
+        std::cerr << "Failed to open " << filename << " for writing." << std::endl;
+        return;
     }
-    out << "P5\n" << width << ' ' << height << "\n255\n";
-    out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(width) * height);
+    out << "P5\n" << width << " " << height << "\n255\n";
+    out.write(reinterpret_cast<const char*>(image.data()),
+              static_cast<std::streamsize>(image.size()));
 }
 
-void WriteTimingCsv(const std::string& path, const Timings& t) {
-    std::ofstream out(path);
-    if (!out) {
-        throw std::runtime_error("Failed to write timings CSV: " + path);
+std::vector<uint8_t> FloatToUint8(const std::vector<float>& input) {
+    std::vector<uint8_t> output(input.size());
+    for (size_t i = 0; i < input.size(); ++i) {
+        float value = input[i];
+        value = std::max(0.0f, std::min(255.0f, value));
+        output[i] = static_cast<uint8_t>(value);
     }
-    out << "stage,cpu_ms,gpu_ms,speedup\n";
-    auto write_row = [&](const std::string& stage, double cpu_ms, double gpu_ms) {
-        const double speedup = gpu_ms > 0.0 ? cpu_ms / gpu_ms : 0.0;
-        out << stage << ',' << std::fixed << std::setprecision(3)
-            << cpu_ms << ',' << gpu_ms << ',' << speedup << '\n';
-    };
-    write_row("blur", t.cpu_blur_ms, t.gpu_blur_ms);
-    write_row("sobel", t.cpu_sobel_ms, t.gpu_sobel_ms);
-    write_row("threshold", t.cpu_threshold_ms, t.gpu_threshold_ms);
-    write_row("total", t.cpu_total_ms, t.gpu_total_ms);
+    return output;
 }
 
-void WriteExecutionLog(const std::string& path,
-                       const Config& cfg,
-                       const Timings& t,
-                       const cudaDeviceProp& prop) {
-    std::ofstream out(path);
-    if (!out) {
-        throw std::runtime_error("Failed to write execution log: " + path);
-    }
-
-    const size_t total_pixels = static_cast<size_t>(cfg.num_images) * cfg.width * cfg.height;
-    const double gpu_speedup = t.gpu_total_ms > 0.0 ? t.cpu_total_ms / t.gpu_total_ms : 0.0;
-
-    out << "CUDA Batch Image Pipeline Execution Log\n";
-    out << "=====================================\n";
-    out << "Images processed: " << cfg.num_images << '\n';
-    out << "Image size: " << cfg.width << 'x' << cfg.height << '\n';
-    out << "Total pixels: " << total_pixels << '\n';
-    out << "Threshold: " << cfg.threshold << '\n';
-    out << "Output directory: " << cfg.output_dir << "\n\n";
-
-    out << "GPU device: " << prop.name << '\n';
-    out << "Compute capability: " << prop.major << '.' << prop.minor << '\n';
-    out << "Global memory (MB): " << (prop.totalGlobalMem / (1024 * 1024)) << '\n';
-    out << "Shared memory per block (KB): " << (prop.sharedMemPerBlock / 1024) << '\n';
-    out << "Multiprocessor count: " << prop.multiProcessorCount << "\n\n";
-
-    out << std::fixed << std::setprecision(3);
-    out << "CPU blur ms: " << t.cpu_blur_ms << '\n';
-    out << "CPU sobel ms: " << t.cpu_sobel_ms << '\n';
-    out << "CPU threshold ms: " << t.cpu_threshold_ms << '\n';
-    out << "CPU total ms: " << t.cpu_total_ms << "\n\n";
-
-    out << "GPU blur ms: " << t.gpu_blur_ms << '\n';
-    out << "GPU sobel ms: " << t.gpu_sobel_ms << '\n';
-    out << "GPU threshold ms: " << t.gpu_threshold_ms << '\n';
-    out << "GPU total ms: " << t.gpu_total_ms << "\n\n";
-
-    out << "Overall speedup (CPU/GPU): " << gpu_speedup << 'x' << '\n';
+std::vector<uint8_t> ThresholdToUint8(const std::vector<uint8_t>& input) {
+    return input;
 }
 
-void CpuBlur(const uint8_t* input, float* output, int width, int height) {
-    static constexpr int kernel[3][3] = {
-        {1, 2, 1},
-        {2, 4, 2},
-        {1, 2, 1},
+void CpuGaussianBlur(const uint8_t* input, float* output, int width, int height) {
+    static constexpr float kernel[3][3] = {
+        {1.0f, 2.0f, 1.0f},
+        {2.0f, 4.0f, 2.0f},
+        {1.0f, 2.0f, 1.0f},
     };
 
     for (int y = 0; y < height; ++y) {
@@ -218,9 +165,9 @@ void CpuBlur(const uint8_t* input, float* output, int width, int height) {
                 for (int kx = -1; kx <= 1; ++kx) {
                     const int xx = ClampInt(x + kx, 0, width - 1);
                     const int yy = ClampInt(y + ky, 0, height - 1);
-                    const int weight = kernel[ky + 1][kx + 1];
+                    const float weight = kernel[ky + 1][kx + 1];
                     sum += static_cast<float>(input[yy * width + xx]) * weight;
-                    weight_sum += static_cast<float>(weight);
+                    weight_sum += weight;
                 }
             }
             output[y * width + x] = sum / weight_sum;
@@ -249,8 +196,8 @@ void CpuSobel(const float* input, float* output, int width, int height) {
                     const int xx = ClampInt(x + kx, 0, width - 1);
                     const int yy = ClampInt(y + ky, 0, height - 1);
                     const float pixel = input[yy * width + xx];
-                    sx += pixel * gx[ky + 1][kx + 1];
-                    sy += pixel * gy[ky + 1][kx + 1];
+                    sx += pixel * static_cast<float>(gx[ky + 1][kx + 1]);
+                    sy += pixel * static_cast<float>(gy[ky + 1][kx + 1]);
                 }
             }
             output[y * width + x] = std::sqrt(sx * sx + sy * sy);
@@ -258,11 +205,43 @@ void CpuSobel(const float* input, float* output, int width, int height) {
     }
 }
 
-void CpuThreshold(const float* input, uint8_t* output, int width, int height, int threshold) {
-    const int count = width * height;
-    for (int i = 0; i < count; ++i) {
-        output[i] = input[i] >= threshold ? 255 : 0;
+void CpuThreshold(const float* input, uint8_t* output, int width, int height, float threshold) {
+    const size_t num_pixels = static_cast<size_t>(width) * static_cast<size_t>(height);
+    for (size_t i = 0; i < num_pixels; ++i) {
+        output[i] = (input[i] >= threshold) ? 255 : 0;
     }
+}
+
+__device__ __forceinline__ int DeviceClampInt(int value, int low, int high) {
+    return (value < low) ? low : ((value > high) ? high : value);
+}
+
+__device__ inline void LoadTileUint8ToFloat(const uint8_t* input,
+                                            float* tile_base,
+                                            int tile_stride,
+                                            int sx,
+                                            int sy,
+                                            int gx,
+                                            int gy,
+                                            int width,
+                                            int height) {
+    gx = DeviceClampInt(gx, 0, width - 1);
+    gy = DeviceClampInt(gy, 0, height - 1);
+    tile_base[sy * tile_stride + sx] = static_cast<float>(input[gy * width + gx]);
+}
+
+__device__ inline void LoadTileFloat(const float* input,
+                                     float* tile_base,
+                                     int tile_stride,
+                                     int sx,
+                                     int sy,
+                                     int gx,
+                                     int gy,
+                                     int width,
+                                     int height) {
+    gx = DeviceClampInt(gx, 0, width - 1);
+    gy = DeviceClampInt(gy, 0, height - 1);
+    tile_base[sy * tile_stride + sx] = input[gy * width + gx];
 }
 
 __global__ void GaussianBlurKernel(const uint8_t* input, float* output, int width, int height) {
@@ -272,31 +251,33 @@ __global__ void GaussianBlurKernel(const uint8_t* input, float* output, int widt
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     const int shared_x = threadIdx.x + kBlurRadius;
     const int shared_y = threadIdx.y + kBlurRadius;
+    float* tile_base = &tile[0][0];
+    const int tile_stride = kTileDim + 2 * kBlurRadius;
 
-    auto load_to_shared = [&](int sx, int sy, int gx, int gy) {
-        gx = ClampInt(gx, 0, width - 1);
-        gy = ClampInt(gy, 0, height - 1);
-        tile[sy][sx] = static_cast<float>(input[gy * width + gx]);
-    };
-
-    load_to_shared(shared_x, shared_y, x, y);
+    LoadTileUint8ToFloat(input, tile_base, tile_stride, shared_x, shared_y, x, y, width, height);
 
     if (threadIdx.x < kBlurRadius) {
-        load_to_shared(threadIdx.x, shared_y, x - kBlurRadius, y);
-        load_to_shared(shared_x + blockDim.x, shared_y, x + blockDim.x, y);
+        LoadTileUint8ToFloat(input, tile_base, tile_stride, threadIdx.x, shared_y,
+                             x - kBlurRadius, y, width, height);
+        LoadTileUint8ToFloat(input, tile_base, tile_stride, shared_x + blockDim.x, shared_y,
+                             x + blockDim.x, y, width, height);
     }
     if (threadIdx.y < kBlurRadius) {
-        load_to_shared(shared_x, threadIdx.y, x, y - kBlurRadius);
-        load_to_shared(shared_x, shared_y + blockDim.y, x, y + blockDim.y);
+        LoadTileUint8ToFloat(input, tile_base, tile_stride, shared_x, threadIdx.y,
+                             x, y - kBlurRadius, width, height);
+        LoadTileUint8ToFloat(input, tile_base, tile_stride, shared_x, shared_y + blockDim.y,
+                             x, y + blockDim.y, width, height);
     }
     if (threadIdx.x < kBlurRadius && threadIdx.y < kBlurRadius) {
-        load_to_shared(threadIdx.x, threadIdx.y, x - kBlurRadius, y - kBlurRadius);
-        load_to_shared(shared_x + blockDim.x, threadIdx.y, x + blockDim.x, y - kBlurRadius);
-        load_to_shared(threadIdx.x, shared_y + blockDim.y, x - kBlurRadius, y + blockDim.y);
-        load_to_shared(shared_x + blockDim.x,
-                       shared_y + blockDim.y,
-                       x + blockDim.x,
-                       y + blockDim.y);
+        LoadTileUint8ToFloat(input, tile_base, tile_stride, threadIdx.x, threadIdx.y,
+                             x - kBlurRadius, y - kBlurRadius, width, height);
+        LoadTileUint8ToFloat(input, tile_base, tile_stride, shared_x + blockDim.x, threadIdx.y,
+                             x + blockDim.x, y - kBlurRadius, width, height);
+        LoadTileUint8ToFloat(input, tile_base, tile_stride, threadIdx.x, shared_y + blockDim.y,
+                             x - kBlurRadius, y + blockDim.y, width, height);
+        LoadTileUint8ToFloat(input, tile_base, tile_stride,
+                             shared_x + blockDim.x, shared_y + blockDim.y,
+                             x + blockDim.x, y + blockDim.y, width, height);
     }
 
     __syncthreads();
@@ -330,31 +311,33 @@ __global__ void SobelKernel(const float* input, float* output, int width, int he
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     const int shared_x = threadIdx.x + kSobelRadius;
     const int shared_y = threadIdx.y + kSobelRadius;
+    float* tile_base = &tile[0][0];
+    const int tile_stride = kTileDim + 2 * kSobelRadius;
 
-    auto load_to_shared = [&](int sx, int sy, int gx, int gy) {
-        gx = ClampInt(gx, 0, width - 1);
-        gy = ClampInt(gy, 0, height - 1);
-        tile[sy][sx] = input[gy * width + gx];
-    };
-
-    load_to_shared(shared_x, shared_y, x, y);
+    LoadTileFloat(input, tile_base, tile_stride, shared_x, shared_y, x, y, width, height);
 
     if (threadIdx.x < kSobelRadius) {
-        load_to_shared(threadIdx.x, shared_y, x - kSobelRadius, y);
-        load_to_shared(shared_x + blockDim.x, shared_y, x + blockDim.x, y);
+        LoadTileFloat(input, tile_base, tile_stride, threadIdx.x, shared_y,
+                      x - kSobelRadius, y, width, height);
+        LoadTileFloat(input, tile_base, tile_stride, shared_x + blockDim.x, shared_y,
+                      x + blockDim.x, y, width, height);
     }
     if (threadIdx.y < kSobelRadius) {
-        load_to_shared(shared_x, threadIdx.y, x, y - kSobelRadius);
-        load_to_shared(shared_x, shared_y + blockDim.y, x, y + blockDim.y);
+        LoadTileFloat(input, tile_base, tile_stride, shared_x, threadIdx.y,
+                      x, y - kSobelRadius, width, height);
+        LoadTileFloat(input, tile_base, tile_stride, shared_x, shared_y + blockDim.y,
+                      x, y + blockDim.y, width, height);
     }
     if (threadIdx.x < kSobelRadius && threadIdx.y < kSobelRadius) {
-        load_to_shared(threadIdx.x, threadIdx.y, x - kSobelRadius, y - kSobelRadius);
-        load_to_shared(shared_x + blockDim.x, threadIdx.y, x + blockDim.x, y - kSobelRadius);
-        load_to_shared(threadIdx.x, shared_y + blockDim.y, x - kSobelRadius, y + blockDim.y);
-        load_to_shared(shared_x + blockDim.x,
-                       shared_y + blockDim.y,
-                       x + blockDim.x,
-                       y + blockDim.y);
+        LoadTileFloat(input, tile_base, tile_stride, threadIdx.x, threadIdx.y,
+                      x - kSobelRadius, y - kSobelRadius, width, height);
+        LoadTileFloat(input, tile_base, tile_stride, shared_x + blockDim.x, threadIdx.y,
+                      x + blockDim.x, y - kSobelRadius, width, height);
+        LoadTileFloat(input, tile_base, tile_stride, threadIdx.x, shared_y + blockDim.y,
+                      x - kSobelRadius, y + blockDim.y, width, height);
+        LoadTileFloat(input, tile_base, tile_stride,
+                      shared_x + blockDim.x, shared_y + blockDim.y,
+                      x + blockDim.x, y + blockDim.y, width, height);
     }
 
     __syncthreads();
@@ -379,249 +362,355 @@ __global__ void SobelKernel(const float* input, float* output, int width, int he
     for (int ky = -1; ky <= 1; ++ky) {
         for (int kx = -1; kx <= 1; ++kx) {
             const float pixel = tile[shared_y + ky][shared_x + kx];
-            sx += pixel * gx[ky + 1][kx + 1];
-            sy += pixel * gy[ky + 1][kx + 1];
+            sx += pixel * static_cast<float>(gx[ky + 1][kx + 1]);
+            sy += pixel * static_cast<float>(gy[ky + 1][kx + 1]);
         }
     }
 
     output[y * width + x] = sqrtf(sx * sx + sy * sy);
 }
 
-__global__ void ThresholdKernel(const float* input, uint8_t* output, int count, int threshold) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < count) {
-        output[idx] = input[idx] >= static_cast<float>(threshold) ? 255 : 0;
+__global__ void ThresholdKernel(const float* input, uint8_t* output,
+                                int width, int height, float threshold) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x < width && y < height) {
+        const float value = input[y * width + x];
+        output[y * width + x] = (value >= threshold) ? 255 : 0;
     }
 }
 
-Timings RunCpuPipeline(const Config& cfg,
-                       const std::vector<uint8_t>& input,
-                       std::vector<float>& blurred,
-                       std::vector<float>& edges,
-                       std::vector<uint8_t>& binary) {
-    Timings t;
-    const size_t pixels_per_image = static_cast<size_t>(cfg.width) * cfg.height;
+TimingResults RunCpuPipeline(const std::vector<uint8_t>& images,
+                             std::vector<uint8_t>* sample_blur,
+                             std::vector<uint8_t>* sample_sobel,
+                             std::vector<uint8_t>* sample_thresh,
+                             int num_images,
+                             int width,
+                             int height,
+                             float threshold) {
+    TimingResults timing;
+    const size_t pixels_per_image = static_cast<size_t>(width) * static_cast<size_t>(height);
 
-    auto cpu_start_total = std::chrono::high_resolution_clock::now();
+    std::vector<float> blur(pixels_per_image);
+    std::vector<float> sobel(pixels_per_image);
+    std::vector<uint8_t> binary(pixels_per_image);
 
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < cfg.num_images; ++i) {
-        CpuBlur(input.data() + i * pixels_per_image,
-                blurred.data() + i * pixels_per_image,
-                cfg.width,
-                cfg.height);
+    const auto start = std::chrono::high_resolution_clock::now();
+
+    for (int n = 0; n < num_images; ++n) {
+        const uint8_t* image = images.data() + static_cast<size_t>(n) * pixels_per_image;
+        CpuGaussianBlur(image, blur.data(), width, height);
+        CpuSobel(blur.data(), sobel.data(), width, height);
+        CpuThreshold(sobel.data(), binary.data(), width, height, threshold);
+
+        if (n == 0) {
+            *sample_blur = FloatToUint8(blur);
+            *sample_sobel = FloatToUint8(sobel);
+            *sample_thresh = ThresholdToUint8(binary);
+        }
     }
-    auto end = std::chrono::high_resolution_clock::now();
-    t.cpu_blur_ms = std::chrono::duration<double, std::milli>(end - start).count();
 
-    start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < cfg.num_images; ++i) {
-        CpuSobel(blurred.data() + i * pixels_per_image,
-                 edges.data() + i * pixels_per_image,
-                 cfg.width,
-                 cfg.height);
-    }
-    end = std::chrono::high_resolution_clock::now();
-    t.cpu_sobel_ms = std::chrono::duration<double, std::milli>(end - start).count();
-
-    start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < cfg.num_images; ++i) {
-        CpuThreshold(edges.data() + i * pixels_per_image,
-                     binary.data() + i * pixels_per_image,
-                     cfg.width,
-                     cfg.height,
-                     cfg.threshold);
-    }
-    end = std::chrono::high_resolution_clock::now();
-    t.cpu_threshold_ms = std::chrono::duration<double, std::milli>(end - start).count();
-
-    auto cpu_end_total = std::chrono::high_resolution_clock::now();
-    t.cpu_total_ms =
-        std::chrono::duration<double, std::milli>(cpu_end_total - cpu_start_total).count();
-    return t;
+    const auto end = std::chrono::high_resolution_clock::now();
+    timing.cpu_total_ms =
+        std::chrono::duration<double, std::milli>(end - start).count();
+    return timing;
 }
 
-void RunGpuPipeline(const Config& cfg,
-                    const std::vector<uint8_t>& input,
-                    std::vector<float>& blurred_out,
-                    std::vector<float>& edges_out,
-                    std::vector<uint8_t>& binary_out,
-                    Timings* t) {
-    const size_t pixels_per_image = static_cast<size_t>(cfg.width) * cfg.height;
-    const size_t total_pixels = static_cast<size_t>(cfg.num_images) * pixels_per_image;
-    const size_t input_bytes = total_pixels * sizeof(uint8_t);
-    const size_t float_bytes = total_pixels * sizeof(float);
+TimingResults RunGpuPipeline(const std::vector<uint8_t>& images,
+                             std::vector<uint8_t>* sample_blur,
+                             std::vector<uint8_t>* sample_sobel,
+                             std::vector<uint8_t>* sample_thresh,
+                             int num_images,
+                             int width,
+                             int height,
+                             float threshold) {
+    TimingResults timing;
+    const size_t pixels_per_image = static_cast<size_t>(width) * static_cast<size_t>(height);
+    const size_t bytes_u8 = pixels_per_image * sizeof(uint8_t);
+    const size_t bytes_f = pixels_per_image * sizeof(float);
 
     uint8_t* d_input = nullptr;
     float* d_blur = nullptr;
-    float* d_edges = nullptr;
-    uint8_t* d_binary = nullptr;
+    float* d_sobel = nullptr;
+    uint8_t* d_threshold = nullptr;
 
-    CHECK_CUDA(cudaMalloc(&d_input, input_bytes));
-    CHECK_CUDA(cudaMalloc(&d_blur, float_bytes));
-    CHECK_CUDA(cudaMalloc(&d_edges, float_bytes));
-    CHECK_CUDA(cudaMalloc(&d_binary, input_bytes));
+    CUDA_CHECK(cudaMalloc(&d_input, bytes_u8));
+    CUDA_CHECK(cudaMalloc(&d_blur, bytes_f));
+    CUDA_CHECK(cudaMalloc(&d_sobel, bytes_f));
+    CUDA_CHECK(cudaMalloc(&d_threshold, bytes_u8));
 
-    CHECK_CUDA(cudaMemcpy(d_input, input.data(), input_bytes, cudaMemcpyHostToDevice));
+    dim3 block(kTileDim, kTileDim);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
 
-    const dim3 block(kTileDim, kTileDim);
-    const dim3 grid((cfg.width + block.x - 1) / block.x, (cfg.height + block.y - 1) / block.y);
-    const int threads_1d = 256;
+    cudaEvent_t total_start, total_stop;
+    cudaEvent_t h2d_start, h2d_stop;
+    cudaEvent_t blur_start, blur_stop;
+    cudaEvent_t sobel_start, sobel_stop;
+    cudaEvent_t thresh_start, thresh_stop;
+    cudaEvent_t d2h_start, d2h_stop;
 
-    cudaEvent_t total_start, total_stop, blur_start, blur_stop, sobel_start, sobel_stop,
-        threshold_start, threshold_stop;
-    CHECK_CUDA(cudaEventCreate(&total_start));
-    CHECK_CUDA(cudaEventCreate(&total_stop));
-    CHECK_CUDA(cudaEventCreate(&blur_start));
-    CHECK_CUDA(cudaEventCreate(&blur_stop));
-    CHECK_CUDA(cudaEventCreate(&sobel_start));
-    CHECK_CUDA(cudaEventCreate(&sobel_stop));
-    CHECK_CUDA(cudaEventCreate(&threshold_start));
-    CHECK_CUDA(cudaEventCreate(&threshold_stop));
+    CUDA_CHECK(cudaEventCreate(&total_start));
+    CUDA_CHECK(cudaEventCreate(&total_stop));
+    CUDA_CHECK(cudaEventCreate(&h2d_start));
+    CUDA_CHECK(cudaEventCreate(&h2d_stop));
+    CUDA_CHECK(cudaEventCreate(&blur_start));
+    CUDA_CHECK(cudaEventCreate(&blur_stop));
+    CUDA_CHECK(cudaEventCreate(&sobel_start));
+    CUDA_CHECK(cudaEventCreate(&sobel_stop));
+    CUDA_CHECK(cudaEventCreate(&thresh_start));
+    CUDA_CHECK(cudaEventCreate(&thresh_stop));
+    CUDA_CHECK(cudaEventCreate(&d2h_start));
+    CUDA_CHECK(cudaEventCreate(&d2h_stop));
 
-    CHECK_CUDA(cudaEventRecord(total_start));
+    std::vector<float> host_blur(pixels_per_image);
+    std::vector<float> host_sobel(pixels_per_image);
+    std::vector<uint8_t> host_thresh(pixels_per_image);
 
-    CHECK_CUDA(cudaEventRecord(blur_start));
-    for (int i = 0; i < cfg.num_images; ++i) {
-        GaussianBlurKernel<<<grid, block>>>(d_input + i * pixels_per_image,
-                                            d_blur + i * pixels_per_image,
-                                            cfg.width,
-                                            cfg.height);
+    CUDA_CHECK(cudaEventRecord(total_start));
+
+    for (int n = 0; n < num_images; ++n) {
+        const uint8_t* image = images.data() + static_cast<size_t>(n) * pixels_per_image;
+
+        CUDA_CHECK(cudaEventRecord(h2d_start));
+        CUDA_CHECK(cudaMemcpy(d_input, image, bytes_u8, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaEventRecord(h2d_stop));
+        CUDA_CHECK(cudaEventSynchronize(h2d_stop));
+
+        CUDA_CHECK(cudaEventRecord(blur_start));
+        GaussianBlurKernel<<<grid, block>>>(d_input, d_blur, width, height);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(blur_stop));
+        CUDA_CHECK(cudaEventSynchronize(blur_stop));
+
+        CUDA_CHECK(cudaEventRecord(sobel_start));
+        SobelKernel<<<grid, block>>>(d_blur, d_sobel, width, height);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(sobel_stop));
+        CUDA_CHECK(cudaEventSynchronize(sobel_stop));
+
+        CUDA_CHECK(cudaEventRecord(thresh_start));
+        ThresholdKernel<<<grid, block>>>(d_sobel, d_threshold, width, height, threshold);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(thresh_stop));
+        CUDA_CHECK(cudaEventSynchronize(thresh_stop));
+
+        if (n == 0) {
+            CUDA_CHECK(cudaEventRecord(d2h_start));
+            CUDA_CHECK(cudaMemcpy(host_blur.data(), d_blur, bytes_f, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(host_sobel.data(), d_sobel, bytes_f, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(host_thresh.data(), d_threshold, bytes_u8, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaEventRecord(d2h_stop));
+            CUDA_CHECK(cudaEventSynchronize(d2h_stop));
+
+            *sample_blur = FloatToUint8(host_blur);
+            *sample_sobel = FloatToUint8(host_sobel);
+            *sample_thresh = ThresholdToUint8(host_thresh);
+        } else {
+            float temp_ms = 0.0f;
+            CUDA_CHECK(cudaEventRecord(d2h_start));
+            CUDA_CHECK(cudaEventRecord(d2h_stop));
+            CUDA_CHECK(cudaEventSynchronize(d2h_stop));
+            CUDA_CHECK(cudaEventElapsedTime(&temp_ms, d2h_start, d2h_stop));
+            timing.gpu_d2h_ms += temp_ms;
+        }
+
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, h2d_start, h2d_stop));
+        timing.gpu_h2d_ms += ms;
+
+        CUDA_CHECK(cudaEventElapsedTime(&ms, blur_start, blur_stop));
+        timing.gpu_blur_ms += ms;
+
+        CUDA_CHECK(cudaEventElapsedTime(&ms, sobel_start, sobel_stop));
+        timing.gpu_sobel_ms += ms;
+
+        CUDA_CHECK(cudaEventElapsedTime(&ms, thresh_start, thresh_stop));
+        timing.gpu_threshold_ms += ms;
+
+        if (n == 0) {
+            CUDA_CHECK(cudaEventElapsedTime(&ms, d2h_start, d2h_stop));
+            timing.gpu_d2h_ms += ms;
+        }
     }
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaEventRecord(blur_stop));
 
-    CHECK_CUDA(cudaEventRecord(sobel_start));
-    for (int i = 0; i < cfg.num_images; ++i) {
-        SobelKernel<<<grid, block>>>(d_blur + i * pixels_per_image,
-                                     d_edges + i * pixels_per_image,
-                                     cfg.width,
-                                     cfg.height);
-    }
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaEventRecord(sobel_stop));
+    CUDA_CHECK(cudaEventRecord(total_stop));
+    CUDA_CHECK(cudaEventSynchronize(total_stop));
 
-    CHECK_CUDA(cudaEventRecord(threshold_start));
-    const int blocks_1d = static_cast<int>((total_pixels + threads_1d - 1) / threads_1d);
-    ThresholdKernel<<<blocks_1d, threads_1d>>>(d_edges, d_binary, static_cast<int>(total_pixels), cfg.threshold);
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaEventRecord(threshold_stop));
+    float total_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&total_ms, total_start, total_stop));
+    timing.gpu_total_ms = total_ms;
 
-    CHECK_CUDA(cudaEventRecord(total_stop));
-    CHECK_CUDA(cudaEventSynchronize(total_stop));
+    CUDA_CHECK(cudaEventDestroy(total_start));
+    CUDA_CHECK(cudaEventDestroy(total_stop));
+    CUDA_CHECK(cudaEventDestroy(h2d_start));
+    CUDA_CHECK(cudaEventDestroy(h2d_stop));
+    CUDA_CHECK(cudaEventDestroy(blur_start));
+    CUDA_CHECK(cudaEventDestroy(blur_stop));
+    CUDA_CHECK(cudaEventDestroy(sobel_start));
+    CUDA_CHECK(cudaEventDestroy(sobel_stop));
+    CUDA_CHECK(cudaEventDestroy(thresh_start));
+    CUDA_CHECK(cudaEventDestroy(thresh_stop));
+    CUDA_CHECK(cudaEventDestroy(d2h_start));
+    CUDA_CHECK(cudaEventDestroy(d2h_stop));
 
-    float ms = 0.0f;
-    CHECK_CUDA(cudaEventElapsedTime(&ms, blur_start, blur_stop));
-    t->gpu_blur_ms = ms;
-    CHECK_CUDA(cudaEventElapsedTime(&ms, sobel_start, sobel_stop));
-    t->gpu_sobel_ms = ms;
-    CHECK_CUDA(cudaEventElapsedTime(&ms, threshold_start, threshold_stop));
-    t->gpu_threshold_ms = ms;
-    CHECK_CUDA(cudaEventElapsedTime(&ms, total_start, total_stop));
-    t->gpu_total_ms = ms;
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_blur));
+    CUDA_CHECK(cudaFree(d_sobel));
+    CUDA_CHECK(cudaFree(d_threshold));
 
-    CHECK_CUDA(cudaMemcpy(blurred_out.data(), d_blur, float_bytes, cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(edges_out.data(), d_edges, float_bytes, cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(binary_out.data(), d_binary, input_bytes, cudaMemcpyDeviceToHost));
-
-    CHECK_CUDA(cudaEventDestroy(total_start));
-    CHECK_CUDA(cudaEventDestroy(total_stop));
-    CHECK_CUDA(cudaEventDestroy(blur_start));
-    CHECK_CUDA(cudaEventDestroy(blur_stop));
-    CHECK_CUDA(cudaEventDestroy(sobel_start));
-    CHECK_CUDA(cudaEventDestroy(sobel_stop));
-    CHECK_CUDA(cudaEventDestroy(threshold_start));
-    CHECK_CUDA(cudaEventDestroy(threshold_stop));
-
-    CHECK_CUDA(cudaFree(d_input));
-    CHECK_CUDA(cudaFree(d_blur));
-    CHECK_CUDA(cudaFree(d_edges));
-    CHECK_CUDA(cudaFree(d_binary));
+    return timing;
 }
 
-std::vector<uint8_t> FloatImageToByte(const float* data, size_t count) {
-    float max_val = 0.0f;
-    for (size_t i = 0; i < count; ++i) {
-        max_val = std::max(max_val, data[i]);
-    }
-    const float scale = max_val > 0.0f ? 255.0f / max_val : 1.0f;
+std::string GetGpuName() {
+    int device = 0;
+    cudaDeviceProp prop{};
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    return std::string(prop.name);
+}
 
-    std::vector<uint8_t> out(count);
-    for (size_t i = 0; i < count; ++i) {
-        const int value = static_cast<int>(data[i] * scale);
-        out[i] = static_cast<uint8_t>(ClampInt(value, 0, 255));
+void WriteExecutionLog(const std::string& filename,
+                       const Options& options,
+                       const TimingResults& timing,
+                       const std::string& gpu_name) {
+    std::ofstream out(filename);
+    out << "CUDA Batch Image Pipeline Execution Log\n";
+    out << "======================================\n";
+    out << "GPU: " << gpu_name << "\n";
+    out << "Number of images: " << options.num_images << "\n";
+    out << "Image size: " << options.width << " x " << options.height << "\n";
+    out << "Threshold: " << options.threshold << "\n\n";
+
+    out << std::fixed << std::setprecision(3);
+    out << "CPU total time (ms): " << timing.cpu_total_ms << "\n";
+    out << "GPU total time (ms): " << timing.gpu_total_ms << "\n";
+    out << "GPU H2D total (ms): " << timing.gpu_h2d_ms << "\n";
+    out << "GPU blur total (ms): " << timing.gpu_blur_ms << "\n";
+    out << "GPU sobel total (ms): " << timing.gpu_sobel_ms << "\n";
+    out << "GPU threshold total (ms): " << timing.gpu_threshold_ms << "\n";
+    out << "GPU D2H total (ms): " << timing.gpu_d2h_ms << "\n";
+
+    if (timing.gpu_total_ms > 0.0) {
+        out << "Speedup (CPU/GPU): " << (timing.cpu_total_ms / timing.gpu_total_ms) << "x\n";
     }
-    return out;
+}
+
+void WriteTimingCsv(const std::string& filename,
+                    const Options& options,
+                    const TimingResults& timing) {
+    std::ofstream out(filename);
+    out << "num_images,width,height,threshold,cpu_total_ms,gpu_total_ms,"
+           "gpu_h2d_ms,gpu_blur_ms,gpu_sobel_ms,gpu_threshold_ms,gpu_d2h_ms,speedup\n";
+    const double speedup = (timing.gpu_total_ms > 0.0)
+                               ? (timing.cpu_total_ms / timing.gpu_total_ms)
+                               : 0.0;
+    out << options.num_images << ','
+        << options.width << ','
+        << options.height << ','
+        << options.threshold << ','
+        << timing.cpu_total_ms << ','
+        << timing.gpu_total_ms << ','
+        << timing.gpu_h2d_ms << ','
+        << timing.gpu_blur_ms << ','
+        << timing.gpu_sobel_ms << ','
+        << timing.gpu_threshold_ms << ','
+        << timing.gpu_d2h_ms << ','
+        << speedup << '\n';
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    try {
-        const Config cfg = ParseArgs(argc, argv);
-        fs::create_directories(cfg.output_dir);
+    const Options options = ParseArguments(argc, argv);
 
-        int device = 0;
-        CHECK_CUDA(cudaSetDevice(device));
-        cudaDeviceProp prop{};
-        CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
+    fs::create_directories("output");
+    fs::create_directories("proof");
 
-        const size_t pixels_per_image = static_cast<size_t>(cfg.width) * cfg.height;
-        const size_t total_pixels = static_cast<size_t>(cfg.num_images) * pixels_per_image;
+    std::cout << "Generating " << options.num_images << " synthetic images of size "
+              << options.width << "x" << options.height << "..." << std::endl;
 
-        std::cout << "Generating " << cfg.num_images << " synthetic images of size "
-                  << cfg.width << 'x' << cfg.height << "..." << std::endl;
-        std::vector<uint8_t> input = GenerateSyntheticBatch(cfg);
+    const std::vector<uint8_t> images =
+        GenerateSyntheticImages(options.num_images, options.width, options.height);
 
-        std::vector<float> cpu_blur(total_pixels, 0.0f);
-        std::vector<float> cpu_edges(total_pixels, 0.0f);
-        std::vector<uint8_t> cpu_binary(total_pixels, 0);
+    std::vector<uint8_t> cpu_blur_sample;
+    std::vector<uint8_t> cpu_sobel_sample;
+    std::vector<uint8_t> cpu_thresh_sample;
 
-        std::vector<float> gpu_blur(total_pixels, 0.0f);
-        std::vector<float> gpu_edges(total_pixels, 0.0f);
-        std::vector<uint8_t> gpu_binary(total_pixels, 0);
+    std::vector<uint8_t> gpu_blur_sample;
+    std::vector<uint8_t> gpu_sobel_sample;
+    std::vector<uint8_t> gpu_thresh_sample;
 
-        std::cout << "Running CPU pipeline..." << std::endl;
-        Timings timings = RunCpuPipeline(cfg, input, cpu_blur, cpu_edges, cpu_binary);
+    std::cout << "Running CPU pipeline..." << std::endl;
+    TimingResults cpu_timing = RunCpuPipeline(images,
+                                              &cpu_blur_sample,
+                                              &cpu_sobel_sample,
+                                              &cpu_thresh_sample,
+                                              options.num_images,
+                                              options.width,
+                                              options.height,
+                                              options.threshold);
 
-        std::cout << "Running GPU pipeline on: " << prop.name << std::endl;
-        RunGpuPipeline(cfg, input, gpu_blur, gpu_edges, gpu_binary, &timings);
+    std::cout << "Running GPU pipeline..." << std::endl;
+    TimingResults gpu_timing = RunGpuPipeline(images,
+                                              &gpu_blur_sample,
+                                              &gpu_sobel_sample,
+                                              &gpu_thresh_sample,
+                                              options.num_images,
+                                              options.width,
+                                              options.height,
+                                              options.threshold);
 
-        const size_t sample_idx0 = 0;
-        const size_t sample_idx1 = std::min<size_t>(1, static_cast<size_t>(cfg.num_images - 1));
-        const size_t offset0 = sample_idx0 * pixels_per_image;
-        const size_t offset1 = sample_idx1 * pixels_per_image;
+    TimingResults total_timing;
+    total_timing.cpu_total_ms = cpu_timing.cpu_total_ms;
+    total_timing.gpu_total_ms = gpu_timing.gpu_total_ms;
+    total_timing.gpu_h2d_ms = gpu_timing.gpu_h2d_ms;
+    total_timing.gpu_blur_ms = gpu_timing.gpu_blur_ms;
+    total_timing.gpu_sobel_ms = gpu_timing.gpu_sobel_ms;
+    total_timing.gpu_threshold_ms = gpu_timing.gpu_threshold_ms;
+    total_timing.gpu_d2h_ms = gpu_timing.gpu_d2h_ms;
 
-        SavePgm(cfg.output_dir + "/input_0.pgm", input.data() + offset0, cfg.width, cfg.height);
-        SavePgm(cfg.output_dir + "/gpu_binary_0.pgm", gpu_binary.data() + offset0, cfg.width, cfg.height);
-        SavePgm(cfg.output_dir + "/gpu_binary_1.pgm", gpu_binary.data() + offset1, cfg.width, cfg.height);
+    SavePGM("output/input_sample.pgm",
+            std::vector<uint8_t>(images.begin(),
+                                 images.begin() + static_cast<long long>(options.width) * options.height),
+            options.width, options.height);
 
-        const std::vector<uint8_t> gpu_blur_0 = FloatImageToByte(gpu_blur.data() + offset0, pixels_per_image);
-        const std::vector<uint8_t> gpu_edges_0 = FloatImageToByte(gpu_edges.data() + offset0, pixels_per_image);
-        SavePgm(cfg.output_dir + "/gpu_blur_0.pgm", gpu_blur_0.data(), cfg.width, cfg.height);
-        SavePgm(cfg.output_dir + "/gpu_edges_0.pgm", gpu_edges_0.data(), cfg.width, cfg.height);
+    SavePGM("output/cpu_blur_sample.pgm", cpu_blur_sample, options.width, options.height);
+    SavePGM("output/cpu_sobel_sample.pgm", cpu_sobel_sample, options.width, options.height);
+    SavePGM("output/cpu_threshold_sample.pgm", cpu_thresh_sample, options.width, options.height);
 
-        if (cfg.save_cpu_outputs) {
-            const std::vector<uint8_t> cpu_blur_0 = FloatImageToByte(cpu_blur.data() + offset0, pixels_per_image);
-            const std::vector<uint8_t> cpu_edges_0 = FloatImageToByte(cpu_edges.data() + offset0, pixels_per_image);
-            SavePgm(cfg.output_dir + "/cpu_blur_0.pgm", cpu_blur_0.data(), cfg.width, cfg.height);
-            SavePgm(cfg.output_dir + "/cpu_edges_0.pgm", cpu_edges_0.data(), cfg.width, cfg.height);
-            SavePgm(cfg.output_dir + "/cpu_binary_0.pgm", cpu_binary.data() + offset0, cfg.width, cfg.height);
-        }
+    SavePGM("output/gpu_blur_sample.pgm", gpu_blur_sample, options.width, options.height);
+    SavePGM("output/gpu_sobel_sample.pgm", gpu_sobel_sample, options.width, options.height);
+    SavePGM("output/gpu_threshold_sample.pgm", gpu_thresh_sample, options.width, options.height);
 
-        WriteTimingCsv(cfg.output_dir + "/timings.csv", timings);
-        WriteExecutionLog(cfg.output_dir + "/execution_log.txt", cfg, timings, prop);
+    const std::string gpu_name = GetGpuName();
+    WriteExecutionLog("execution_log.txt", options, total_timing, gpu_name);
+    WriteTimingCsv("timings.csv", options, total_timing);
 
-        const double speedup = timings.gpu_total_ms > 0.0 ? timings.cpu_total_ms / timings.gpu_total_ms : 0.0;
-        std::cout << std::fixed << std::setprecision(3);
-        std::cout << "CPU total time: " << timings.cpu_total_ms << " ms\n";
-        std::cout << "GPU total time: " << timings.gpu_total_ms << " ms\n";
-        std::cout << "Overall speedup: " << speedup << "x\n";
-        std::cout << "Saved outputs to: " << cfg.output_dir << std::endl;
-
-        return EXIT_SUCCESS;
-    } catch (const std::exception& ex) {
-        std::cerr << "Error: " << ex.what() << std::endl;
-        return EXIT_FAILURE;
+    std::ofstream terminal_log("proof/terminal_run.log");
+    terminal_log << "CUDA Batch Image Pipeline\n";
+    terminal_log << "GPU: " << gpu_name << '\n';
+    terminal_log << "Images: " << options.num_images << '\n';
+    terminal_log << "Dimensions: " << options.width << " x " << options.height << '\n';
+    terminal_log << std::fixed << std::setprecision(3);
+    terminal_log << "CPU total time (ms): " << total_timing.cpu_total_ms << '\n';
+    terminal_log << "GPU total time (ms): " << total_timing.gpu_total_ms << '\n';
+    if (total_timing.gpu_total_ms > 0.0) {
+        terminal_log << "Speedup (CPU/GPU): "
+                     << (total_timing.cpu_total_ms / total_timing.gpu_total_ms) << "x\n";
     }
+
+    std::cout << "\nDone.\n";
+    std::cout << "GPU: " << gpu_name << "\n";
+    std::cout << "CPU total time (ms): " << std::fixed << std::setprecision(3)
+              << total_timing.cpu_total_ms << "\n";
+    std::cout << "GPU total time (ms): " << total_timing.gpu_total_ms << "\n";
+    if (total_timing.gpu_total_ms > 0.0) {
+        std::cout << "Speedup (CPU/GPU): "
+                  << (total_timing.cpu_total_ms / total_timing.gpu_total_ms) << "x\n";
+    }
+    std::cout << "Saved outputs to output/\n";
+    std::cout << "Saved logs to execution_log.txt, timings.csv, and proof/terminal_run.log\n";
+
+    return 0;
 }
