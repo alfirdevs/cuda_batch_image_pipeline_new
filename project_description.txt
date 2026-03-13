@@ -1,0 +1,13 @@
+CUDA at Scale Independent Project Description
+
+I implemented a batch image-processing project using CUDA. The program generates a large set of synthetic grayscale images and processes them in a single execution. Each image passes through three stages: Gaussian blur, Sobel edge detection, and binary thresholding.
+
+The project includes both CPU and GPU versions of the pipeline so that performance can be compared. The GPU version uses custom CUDA kernels, and the blur and Sobel stages use shared-memory tiling because each output pixel depends on a small neighborhood of surrounding pixels.
+
+To satisfy the data-volume requirement, the default configuration processes 256 images of size 2048x2048 in one run. The repository also includes a README, a Makefile, a run script, and proof artifacts such as output images, a timing CSV file, and an execution log. This makes the project easy for reviewers to build, run, and evaluate.
+
+Main lessons learned:
+- stencil-based image operations map naturally to CUDA kernels
+- shared memory helps reduce repeated global-memory access
+- comparing CPU and GPU versions makes the acceleration easy to demonstrate
+- a clean repository structure and proof artifacts are important for reproducibility
